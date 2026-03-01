@@ -1,0 +1,15 @@
+cat <<EOF > .gitignore
+# 忽略第三方库和 NPU 运行时
+3rdparty/
+rkllm-runtime/
+
+# 忽略编译中间产物和可执行输出
+build/
+
+# 常见二进制和临时文件
+*.so
+*.a
+*.o
+*.bin
+.vscode/
+EOF
