@@ -34,9 +34,11 @@
 #include <mutex>   // 提供互斥锁，防止读写冲突
 #include <atomic>  // 提供原子变量，用于安全地控制线程退出
 #include <csignal>
-#define VIDEO_NODE "/dev/video8"
-#define IMG_WIDTH  4672
-#define IMG_HEIGHT 3504
+#include "im2d.h"
+#include "rga.h"
+#define VIDEO_NODE "/dev/video9"
+#define IMG_WIDTH  1920
+#define IMG_HEIGHT 1080
 using namespace std;
 LLMHandle llmHandle = nullptr;
 //-----------------------------------------multi_thread------------------------------------------------
@@ -455,31 +457,113 @@ int main(int argc, char** argv)
                 nv12_img = latest_nv12_frame.clone(); 
             } // 大括号结束，锁自动释放！此时后台线程又可以继续疯狂抓图了。
 
-            std::cout << "--> DEBUG 3: 开始处理图像颜色转换" << std::endl;
-            cv::Mat img;
-            // 3. 把原始的 NV12 转成 BGR，然后再转成大模型需要的 RGB
-            // 现在这个耗时操作不会阻塞底层的摄像头硬件队列了！
-            cv::cvtColor(nv12_img, img, cv::COLOR_YUV2BGR_NV12);
-            cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+          
+        //     std::cout << "--> DEBUG 3: 启动 RGA 硬件加速 (色彩转换+填充+缩放)" << std::endl;
+            
+        //    size_t image_width = rknn_app_ctx.model_width;
+        //     size_t image_height = rknn_app_ctx.model_height;
 
+        //     // 1. 申请一块最终送给模型的内存 (RGB888格式)
+        //     std::vector<uint8_t> rgb_buf(image_width * image_height * 3);
+            
+        //     // 2. 模拟 expand2square 的背景色：直接把这块内存全刷成灰色 (127)
+        //     memset(rgb_buf.data(), 127, image_width * image_height * 3);
 
-            std::cout << "--> DEBUG 4: 准备 expand2square" << std::endl;
-            cv::Scalar background_color(127.5, 127.5, 127.5);
-            cv::Mat square_img = expand2square(img, background_color);
+        //     // 3. 计算原图按比例缩放后，应该贴在目标灰图的哪个位置 (保持画面不被拉伸变形)
+        //     int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
+        //     float scale = (float)image_width / max_dim; 
+            
+        //     int scaled_w = IMG_WIDTH * scale;
+        //     int scaled_h = IMG_HEIGHT * scale;
+        //     int dx = (image_width - scaled_w) / 2; // X轴偏移量 (居中)
+        //     int dy = (image_height - scaled_h) / 2; // Y轴偏移量 (居中)
 
-            std::cout << "--> DEBUG 5: 准备 resize" << std::endl;
-            size_t image_width = rknn_app_ctx.model_width;
-            size_t image_height = rknn_app_ctx.model_height;
-            cv::Mat resized_img;
-            cv::resize(square_img, resized_img, cv::Size(image_width, image_height), 0, 0, cv::INTER_LINEAR);
+        //     // 4. 配置 RGA 的输入和输出 Buffer
+        //     // 源图：刚刚抓到的 NV12，分辨率是 IMG_WIDTH x IMG_HEIGHT
+        //     rga_buffer_t src = wrapbuffer_virtualaddr((void*)nv12_img.data, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
+        //     // 目标图：我们刚申请的 RGB 数组，分辨率是 image_width x image_height
+        //     rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rgb_buf.data(), image_width, image_height, RK_FORMAT_RGB_888);
 
+        //     // 5. 设置处理区域 (ROI)
+        //     im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; // 截取原图的全部
+        //     im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  // 贴到目标图的居中位置
+
+        //     // 6. 一键呼叫硬件！(improcess 会瞬间完成格式转换和缩放粘贴)
+        //     rga_buffer_t empty_pat = {0};
+        //     im_rect empty_rect = {0, 0, 0, 0};
+        //     IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
+        //     if (rga_stat != IM_STATUS_SUCCESS) {
+        //         printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
+        //     }
+
+        //     std::cout << "--> DEBUG 6: 准备 run_imgenc" << std::endl;
+        //     // 直接把 RGA 处理好的 rgb_buf 喂给特征提取模型
+        //     ret = run_imgenc(&rknn_app_ctx, rgb_buf.data(), img_vec.data());
+
+        //     std::cout << "--> DEBUG 7: run_imgenc 结束" << std::endl;
+        //     if (ret != 0) {
+        //         printf("run_imgenc fail! ret=%d\n", ret);
+        //     }
+        //     rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
+        //     rkllm_input.role = "user";
+        //     rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
+        //     rkllm_input.multimodal_input.image_embed = img_vec.data();
+        //     rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
+        //     rkllm_input.multimodal_input.n_image = 1;
+        //     rkllm_input.multimodal_input.image_height = image_height;
+        //     rkllm_input.multimodal_input.image_width = image_width;
+            std::cout << "--> DEBUG 3: 启动 RGA 硬件加速 (处理 Stride 对齐)" << std::endl;
+            
+            size_t image_width = rknn_app_ctx.model_width;   // 392
+            size_t image_height = rknn_app_ctx.model_height; // 392
+
+            // 1. 计算 16 字节对齐的 width stride
+            int aligned_w = (image_width + 15) & (~15); // 392 -> 400
+
+            // 2. 申请对齐后的内存缓冲区
+            std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
+            memset(rga_buf.data(), 127, aligned_w * image_height * 3);
+
+            // 3. 计算缩放参数与 ROI 偏移
+            int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
+            float scale = (float)image_width / max_dim; 
+            int scaled_w = IMG_WIDTH * scale;
+            int scaled_h = IMG_HEIGHT * scale;
+            int dx = (image_width - scaled_w) / 2;
+            int dy = (image_height - scaled_h) / 2;
+
+            // 4. 构建 RGA 内存描述符 (使用完整参数列表，显式指定 dst 的 wstride 为 aligned_w)
+            rga_buffer_t src = wrapbuffer_virtualaddr((void*)nv12_img.data, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
+            // 参数列表: vir_addr, width, height, format, wstride, hstride
+            rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, aligned_w, image_height);
+
+            im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; 
+            im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  
+
+            rga_buffer_t empty_pat;
+            memset(&empty_pat, 0, sizeof(empty_pat));
+            im_rect empty_rect = {0, 0, 0, 0};
+            auto t_rga_start = std::chrono::high_resolution_clock::now();
+            // 执行 RGA 硬件加速
+            IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
+            if (rga_stat != IM_STATUS_SUCCESS) {
+                printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
+            }
+
+            // 5. 内存重排 (Memory Repacking)
+            // rga_buf 当前步长为 400，存在无效 Padding。
+            // 映射为 Mat 并裁切 392x392 区域，clone() 会强制分配一块紧凑连续的内存。
+            cv::Mat rga_mat(image_height, aligned_w, CV_8UC3, rga_buf.data());
+            cv::Mat packed_mat = rga_mat(cv::Rect(0, 0, image_width, image_height)).clone();
+            auto t_rga_end = std::chrono::high_resolution_clock::now();
             std::cout << "--> DEBUG 6: 准备 run_imgenc" << std::endl;
-            // 注意：请确保 img_vec 已经 malloc 或 new 了足够的内存！
-            ret = run_imgenc(&rknn_app_ctx, resized_img.data, img_vec.data());
-            std::cout << "--> DEBUG 7: run_imgenc 结束" << std::endl;
+            // 传入去除了 Padding 的连续内存指针 packed_mat.data
+            ret = run_imgenc(&rknn_app_ctx, packed_mat.data, img_vec.data());
+            auto t_npu_end = std::chrono::high_resolution_clock::now();
             if (ret != 0) {
                 printf("run_imgenc fail! ret=%d\n", ret);
             }
+            
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.role = "user";
             rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
@@ -488,6 +572,12 @@ int main(int argc, char** argv)
             rkllm_input.multimodal_input.n_image = 1;
             rkllm_input.multimodal_input.image_height = image_height;
             rkllm_input.multimodal_input.image_width = image_width;
+            auto rga_cost = std::chrono::duration_cast<std::chrono::milliseconds>(t_rga_end - t_rga_start).count();
+            auto npu_cost = std::chrono::duration_cast<std::chrono::milliseconds>(t_npu_end - t_rga_end).count();
+            
+            std::cout << "\n[异构流水线打点]" << std::endl;
+            std::cout << " -> RGA 预处理耗时: " << rga_cost << " ms" << std::endl;
+            std::cout << " -> NPU 视觉编码耗时: " << npu_cost << " ms" << std::endl;
         }
         printf("robot: ");
         rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
