@@ -43,20 +43,63 @@ using namespace std;
 LLMHandle llmHandle = nullptr;
 //-----------------------------------------multi_thread------------------------------------------------
 // 多线程全局控制变量
-std::mutex camera_mutex;              // 互斥锁：保证同一时间只有一个人能碰图片
-cv::Mat latest_nv12_frame;            // 共享内存：永远存放最新的一帧原始 NV12 图片
-std::atomic<bool> keep_running{true}; // 线程开关：当它变成 false 时，抓图线程就会乖乖退出
-std::thread* camera_thread = nullptr; // 指向我们后台抓图线程的指针
+//std::mutex camera_mutex;              // 互斥锁：保证同一时间只有一个人能碰图片
+//cv::Mat latest_nv12_frame;            // 共享内存：永远存放最新的一帧原始 NV12 图片
+//std::atomic<bool> keep_running{true}; // 线程开关：当它变成 false 时，抓图线程就会乖乖退出
+//std::thread* camera_thread = nullptr; // 指向我们后台抓图线程的指针
+// 将当前线程绑定到指定的 CPU 核心范围 (例如：起始核0，结束核3)
+bool bind_thread_to_cpus(int start_core, int end_core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    for (int i = start_core; i <= end_core; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    pthread_t current_thread = pthread_self();
+    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    
+    if (rc != 0) {
+        std::cerr << "[Warning] Error calling pthread_setaffinity_np: " << rc << std::endl;
+        return false;
+    }
+    
+    std::cout << "[INFO] 成功将线程绑定到 CPU " << start_core << " ~ " << end_core << std::endl;
+    return true;
+}
 //-----------------------------------------camera--------------------------------
+// -------------------- 新增：DMA-BUF 与多线程控制 --------------------
+#define BUFFER_COUNT 4 // 申请 4 个 Buffer，保证流水线不卡死
+
+struct CameraBuffer {
+    int index;           // Buffer 序号
+    int fd;              // 导出的 DMA-BUF 文件描述符
+    void* start;         // 依然保留虚拟地址映射（以备不时之需或调试）
+    size_t length;
+    bool in_use_by_llm;  // 核心标志位：是否正在被大模型占用
+};
+
 struct CameraState {
     int fd;
-    struct v4l2_buffer buf;
-    struct v4l2_plane planes[1]; // 修复：必须存在全局结构体里，否则会变成悬空指针
-    void* buffer_start;
-    unsigned int buffer_length;  // 修复：记录长度，方便 munmap 时使用
+    CameraBuffer buffers[BUFFER_COUNT];
 };
 
 struct CameraState CS;
+
+std::mutex camera_mutex;              // 互斥锁
+int latest_buf_index = -1;            // 共享变量：永远存放最新一帧的 index（不再是 cv::Mat）
+int last_held_index=-1;
+std::atomic<bool> keep_running{true}; // 线程开关
+std::thread* camera_thread = nullptr;
+// struct CameraState {
+//     int fd;
+//     struct v4l2_buffer buf;
+//     struct v4l2_plane planes[1]; // 修复：必须存在全局结构体里，否则会变成悬空指针
+//     void* buffer_start;
+//     unsigned int buffer_length;  // 修复：记录长度，方便 munmap 时使用
+// };
+
+//struct CameraState CS;
 
 bool init_camera() {
     CS.fd = open(VIDEO_NODE, O_RDWR); // 直接存入 CS.fd
@@ -81,9 +124,20 @@ bool init_camera() {
     }
 
     // 3. Request Buffers
+    // struct v4l2_requestbuffers req;
+    // memset(&req, 0, sizeof(req));
+    // req.count = 1;
+    // req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    // req.memory = V4L2_MEMORY_MMAP;
+
+    // if (ioctl(CS.fd, VIDIOC_REQBUFS, &req) < 0) {
+    //     perror("[ERROR] VIDIOC_REQBUFS failed");
+    //     close(CS.fd);
+    //     return false;
+    // }
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
-    req.count = 1;
+    req.count = BUFFER_COUNT; // 【改动1】从 1 改成 BUFFER_COUNT (也就是 4)
     req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     req.memory = V4L2_MEMORY_MMAP;
 
@@ -92,37 +146,85 @@ bool init_camera() {
         close(CS.fd);
         return false;
     }
-
     // 4. Query and Map Buffer
-    memset(&CS.buf, 0, sizeof(CS.buf));
-    memset(CS.planes, 0, sizeof(CS.planes)); // 初始化结构体里的 planes
-    CS.buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    CS.buf.memory = V4L2_MEMORY_MMAP;
-    CS.buf.index = 0;
-    CS.buf.length = 1; 
-    CS.buf.m.planes = CS.planes; // 安全绑定！
+    // 4. 遍历这 4 个 Buffer：查询属性、导出 FD、映射内存、交还给底层
+    for (int i = 0; i < BUFFER_COUNT; ++i) {
+        struct v4l2_plane planes[1];
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        memset(planes, 0, sizeof(planes));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+        buf.length = 1;
+        buf.m.planes = planes;
 
-    if (ioctl(CS.fd, VIDIOC_QUERYBUF, &CS.buf) < 0) {
-        perror("[ERROR] VIDIOC_QUERYBUF failed");
-        close(CS.fd);
-        return false;
+        // 查询第 i 个 Buffer 的信息
+        if (ioctl(CS.fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            perror("[ERROR] VIDIOC_QUERYBUF failed");
+            return false;
+        }
+
+        // 【改动2：最核心的一步！】导出 DMA-BUF 文件描述符 (FD)
+        struct v4l2_exportbuffer expbuf;
+        memset(&expbuf, 0, sizeof(expbuf));
+        expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        expbuf.index = i;
+        expbuf.plane = 0; // NV12 往往只有一个 Plane
+        
+        if (ioctl(CS.fd, VIDIOC_EXPBUF, &expbuf) == 0) {
+            // 成功拿到了宝贵的硬件 FD，存入我们的全局结构体中！
+            CS.buffers[i].fd = expbuf.fd;
+            std::cout << "[INFO] 成功导出 Buffer " << i << " 的 DMA FD: " << expbuf.fd << std::endl;
+        } else {
+            perror("[ERROR] VIDIOC_EXPBUF failed");
+            return false;
+        }
+
+        // 记录其他信息
+        CS.buffers[i].index = i;
+        CS.buffers[i].length = buf.m.planes[0].length;
+        CS.buffers[i].in_use_by_llm = false; // 初始状态：大模型没有在用它
+
+        // 虽然我们要用 FD，但也同时把它映射成虚拟地址，方便后续调试
+        CS.buffers[i].start = mmap(NULL, buf.m.planes[0].length, PROT_READ | PROT_WRITE, 
+                                   MAP_SHARED, CS.fd, buf.m.planes[0].m.mem_offset);
+
+        // QBUF: 把空 Buffer 正式塞回给底层驱动，让它准备拍照装填数据
+        if (ioctl(CS.fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("[ERROR] VIDIOC_QBUF failed");
+            return false;
+        }
     }
+    // memset(&CS.buf, 0, sizeof(CS.buf));
+    // memset(CS.planes, 0, sizeof(CS.planes)); // 初始化结构体里的 planes
+    // CS.buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+    // CS.buf.memory = V4L2_MEMORY_MMAP;
+    // CS.buf.index = 0;
+    // CS.buf.length = 1; 
+    // CS.buf.m.planes = CS.planes; // 安全绑定！
 
-    CS.buffer_length = CS.buf.m.planes[0].length;
-    CS.buffer_start = mmap(NULL, CS.buffer_length, PROT_READ | PROT_WRITE, 
-                           MAP_SHARED, CS.fd, CS.buf.m.planes[0].m.mem_offset);
+    // if (ioctl(CS.fd, VIDIOC_QUERYBUF, &CS.buf) < 0) {
+    //     perror("[ERROR] VIDIOC_QUERYBUF failed");
+    //     close(CS.fd);
+    //     return false;
+    // }
+
+    // CS.buffer_length = CS.buf.m.planes[0].length;
+    // CS.buffer_start = mmap(NULL, CS.buffer_length, PROT_READ | PROT_WRITE, 
+    //                        MAP_SHARED, CS.fd, CS.buf.m.planes[0].m.mem_offset);
                            
-    if (CS.buffer_start == MAP_FAILED) {
-        perror("[ERROR] mmap failed");
-        close(CS.fd);
-        return false;
-    }
+    // if (CS.buffer_start == MAP_FAILED) {
+    //     perror("[ERROR] mmap failed");
+    //     close(CS.fd);
+    //     return false;
+    // }
 
     // 重点：开流(STREAMON)之前，先要把缓存(QBUF)交给底层，让它有地方存第一张图！
-    if (ioctl(CS.fd, VIDIOC_QBUF, &CS.buf) < 0) {
-        perror("[ERROR] VIDIOC_QBUF failed");
-        return false;
-    }
+    // if (ioctl(CS.fd, VIDIOC_QBUF, &CS.buf) < 0) {
+    //     perror("[ERROR] VIDIOC_QBUF failed");
+    //     return false;
+    // }
 
     // 5. Stream on
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -134,65 +236,81 @@ bool init_camera() {
     std::cout << "[INFO] Camera initialized successfully!" << std::endl;
     return true; // 修复：别忘了成功时返回 true
 }
-
-// 修复：返回值改为 cv::Mat
-// cv::Mat get_camera_frame() {
-//     // 1. 出队 (DQBUF) -> 拿到硬件填满的图像
-//     if (ioctl(CS.fd, VIDIOC_DQBUF, &CS.buf) < 0) {
-//         perror("[ERROR] VIDIOC_DQBUF failed");
-//         return cv::Mat(); // 返回空图片
-//     }
-
-//     // 2. 图像转换
-//     cv::Mat nv12_mat(IMG_HEIGHT * 3 / 2, IMG_WIDTH, CV_8UC1, CS.buffer_start);
-//     cv::Mat bgr_mat;
-//     cv::cvtColor(nv12_mat, bgr_mat, cv::COLOR_YUV2BGR_NV12); 
-
-//     // 3. 入队 (QBUF) -> 转换完后，赶紧把空内存还给硬件，让它去拍下一张！
-//     if (ioctl(CS.fd, VIDIOC_QBUF, &CS.buf) < 0) {
-//         perror("[ERROR] VIDIOC_QBUF (re-queue) failed");
-//         // 不 return 错，因为至少这帧我们拿到了
-//     }
-
-//     return bgr_mat;
-// }
 // 后台抓图线程函数 (生产者)
 void camera_thread_func() {
+      int rc = pthread_setname_np(pthread_self(), "camera"); // <= 15 chars
+    if (rc != 0) {
+        std::cerr << "pthread_setname_np failed: " << std::strerror(rc) << "\n";
+    }
+    bind_thread_to_cpus(0, 3);
     std::cout << "[INFO] 后台抓图线程已启动..." << std::endl;
+    
     while (keep_running) {
         // 1. DQBUF (从底层硬件拿到装满画面的 buffer)
-        if (ioctl(CS.fd, VIDIOC_DQBUF, &CS.buf) < 0) {
+        struct v4l2_plane planes[1];
+        struct v4l2_buffer buf;
+        memset(&buf, 0, sizeof(buf));
+        memset(planes, 0, sizeof(planes));
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        
+        buf.length = 1;
+        buf.m.planes = planes;
+        if (ioctl(CS.fd, VIDIOC_DQBUF, &buf) < 0) {
             // 如果没拿到，稍微等一下继续尝试，防止死循环占满 CPU
             std::this_thread::sleep_for(std::chrono::milliseconds(5));
             continue; 
         }
-
+        int new_index=buf.index;
         // 2. 加锁，更新全局图片
         {
-            // lock_guard 极其好用：大括号开始时自动加锁，大括号结束时自动解锁！
             std::lock_guard<std::mutex> lock(camera_mutex); 
-            
-            // 创建一个指向 V4L2 内存的 Mat 头
-            cv::Mat temp(IMG_HEIGHT * 3 / 2, IMG_WIDTH, CV_8UC1, CS.buffer_start);
-            
-            // 重点：必须用 clone() 进行深拷贝！
-            // 因为下一步我们就要把 V4L2 的内存还回去了，如果不深拷贝，数据会被覆盖。
-            latest_nv12_frame = temp.clone(); 
+            if(last_held_index!=-1&&!CS.buffers[last_held_index].in_use_by_llm){
+                struct v4l2_plane qplanes[1];
+                struct v4l2_buffer qbuf;
+                memset(&qbuf, 0, sizeof(qbuf));
+                memset(qplanes, 0, sizeof(qplanes));
+                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qbuf.memory = V4L2_MEMORY_MMAP;
+                qbuf.index=last_held_index;
+                qbuf.length = 1;
+                qbuf.m.planes = qplanes;
+                if (ioctl(CS.fd, VIDIOC_QBUF, &qbuf) < 0) {
+                    // 如果没拿到，稍微等一下继续尝试，防止死循环占满 CPU
+                    perror("[ERROR] VIDIOC_QBUF failed in thread");
+                }
+            }
+            last_held_index=new_index;
+            latest_buf_index=new_index;
         }
-
-        // 3. QBUF (把空出来的 buffer 赶紧还给底层，让它去拍下一张)
-        if (ioctl(CS.fd, VIDIOC_QBUF, &CS.buf) < 0) {
-            perror("[ERROR] VIDIOC_QBUF failed in thread");
-        }
+       
     }
     std::cout << "[INFO] 后台抓图线程已安全退出。" << std::endl;
 }
 void release_camera() {
+    // 1. 停止视频流
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
     ioctl(CS.fd, VIDIOC_STREAMOFF, &type);
-    munmap(CS.buffer_start, CS.buffer_length); // 使用存下来的 length
-    close(CS.fd);
-    std::cout << "[INFO] Camera released." << std::endl;
+
+    // 2. 遍历释放我们申请的 4 个 Buffer
+    for (int i = 0; i < BUFFER_COUNT; ++i) {
+        // 解除虚拟地址映射
+        if (CS.buffers[i].start != NULL && CS.buffers[i].start != MAP_FAILED) {
+            munmap(CS.buffers[i].start, CS.buffers[i].length);
+        }
+        
+        // 【极其重要】关闭导出的 DMA-BUF 文件描述符！防止内存和句柄泄露！
+        if (CS.buffers[i].fd > 0) {
+            close(CS.buffers[i].fd);
+        }
+    }
+
+    // 3. 关闭摄像头设备节点
+    if (CS.fd > 0) {
+        close(CS.fd);
+    }
+    
+    std::cout << "[INFO] Camera resources and DMA-BUFs released safely." << std::endl;
 }
 //-----------------------------------------camera-end----------------------------
 
@@ -288,6 +406,9 @@ int main(int argc, char** argv)
     }
     //std::signal(SIGINT, exit_handler);
     // --- 新增：启动后台抓图线程 ---
+    bind_thread_to_cpus(4, 7);
+    std::cout << "[INFO] 锁定 CPU 为最高性能模式 (performance)..." << std::endl;
+    system("echo performance | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor > /dev/null");
     camera_thread = new std::thread(camera_thread_func);
     // 等待一下，确保后台线程能抓到第一张图，避免主线程跑太快拿到空图
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
@@ -350,30 +471,13 @@ int main(int argc, char** argv)
     load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
     printf("%s: ImgEnc Model loaded in %8.2f ms\n", __func__, load_time.count() / 1000.0);
 
-    // The image is read in BGR format
-    // cv::Mat img = cv::imread(image_path);
-    // cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
-
-    // // Expand the image into a square and fill it with the specified background color (According the modeling_minicpmv.py)
-    // cv::Scalar background_color(127.5, 127.5, 127.5);
-    // cv::Mat square_img = expand2square(img, background_color);
-
-    // Resize the image
-    // size_t image_width = rknn_app_ctx.model_width;
-    // size_t image_height = rknn_app_ctx.model_height;
-    // cv::Mat resized_img;
-    // cv::Size new_size(image_width, image_height);
-    // cv::resize(square_img, resized_img, new_size, 0, 0, cv::INTER_LINEAR);
 
     size_t n_image_tokens = rknn_app_ctx.model_image_token;
     size_t image_embed_len = rknn_app_ctx.model_embed_size;
     int rkllm_image_embed_len = n_image_tokens * image_embed_len;
     //float img_vec[rkllm_image_embed_len];
     std::vector<float> img_vec(rkllm_image_embed_len);
-    // ret = run_imgenc(&rknn_app_ctx, resized_img.data, img_vec);
-    // if (ret != 0) {
-    //     printf("run_imgenc fail! ret=%d\n", ret);
-    // }
+    
     
     RKLLMInput rkllm_input;
     memset(&rkllm_input, 0, sizeof(RKLLMInput));
@@ -430,88 +534,26 @@ int main(int argc, char** argv)
             rkllm_input.role = "user";
             rkllm_input.prompt_input = (char*)input_str.c_str();
         } else {
-            // std::cout << "[INFO] 侦测到 <image> 标签，正在抓取最新摄像头画面..." << std::endl;
-
-            // std::cout << "--> DEBUG 1: 准备调用 get_camera_frame" << std::endl;
-            // cv::Mat img = get_camera_frame();
-            // std::cout << "--> DEBUG 2: get_camera_frame 调用结束" << std::endl;
-
-            // if (img.empty()) {
-            //     std::cout << "[ERROR] 抓图失败，请检查摄像头！" << std::endl;
-            //     continue; 
-            // }
-
-            // std::cout << "--> DEBUG 3: 准备 cvtColor" << std::endl;
-            // cv::cvtColor(img, img, cv::COLOR_BGR2RGB);
+           
             std::cout << "[INFO] 侦测到 <image> 标签，正在从共享内存获取最新画面..." << std::endl;
-            
+            int process_id=-1;
+            int process_fd=-1;
             cv::Mat nv12_img;
             {
                 // 1. 加锁：去全局变量里拿图，防止抓图线程此时正好在写入导致图像撕裂
                 std::lock_guard<std::mutex> lock(camera_mutex);
-                if (latest_nv12_frame.empty()) {
+                if (latest_buf_index==-1) {
                     std::cout << "[WARNING] 后台还没抓到图，请稍后再试！" << std::endl;
                     continue;
                 }
                 // 2. 深拷贝出来给主线程用。因为都在内存里，这步极快！
-                nv12_img = latest_nv12_frame.clone(); 
+                process_id=latest_buf_index;
+                process_fd=CS.buffers[latest_buf_index].fd;
+                CS.buffers[latest_buf_index].in_use_by_llm=true;
             } // 大括号结束，锁自动释放！此时后台线程又可以继续疯狂抓图了。
 
           
-        //     std::cout << "--> DEBUG 3: 启动 RGA 硬件加速 (色彩转换+填充+缩放)" << std::endl;
-            
-        //    size_t image_width = rknn_app_ctx.model_width;
-        //     size_t image_height = rknn_app_ctx.model_height;
-
-        //     // 1. 申请一块最终送给模型的内存 (RGB888格式)
-        //     std::vector<uint8_t> rgb_buf(image_width * image_height * 3);
-            
-        //     // 2. 模拟 expand2square 的背景色：直接把这块内存全刷成灰色 (127)
-        //     memset(rgb_buf.data(), 127, image_width * image_height * 3);
-
-        //     // 3. 计算原图按比例缩放后，应该贴在目标灰图的哪个位置 (保持画面不被拉伸变形)
-        //     int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
-        //     float scale = (float)image_width / max_dim; 
-            
-        //     int scaled_w = IMG_WIDTH * scale;
-        //     int scaled_h = IMG_HEIGHT * scale;
-        //     int dx = (image_width - scaled_w) / 2; // X轴偏移量 (居中)
-        //     int dy = (image_height - scaled_h) / 2; // Y轴偏移量 (居中)
-
-        //     // 4. 配置 RGA 的输入和输出 Buffer
-        //     // 源图：刚刚抓到的 NV12，分辨率是 IMG_WIDTH x IMG_HEIGHT
-        //     rga_buffer_t src = wrapbuffer_virtualaddr((void*)nv12_img.data, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
-        //     // 目标图：我们刚申请的 RGB 数组，分辨率是 image_width x image_height
-        //     rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rgb_buf.data(), image_width, image_height, RK_FORMAT_RGB_888);
-
-        //     // 5. 设置处理区域 (ROI)
-        //     im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; // 截取原图的全部
-        //     im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  // 贴到目标图的居中位置
-
-        //     // 6. 一键呼叫硬件！(improcess 会瞬间完成格式转换和缩放粘贴)
-        //     rga_buffer_t empty_pat = {0};
-        //     im_rect empty_rect = {0, 0, 0, 0};
-        //     IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
-        //     if (rga_stat != IM_STATUS_SUCCESS) {
-        //         printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
-        //     }
-
-        //     std::cout << "--> DEBUG 6: 准备 run_imgenc" << std::endl;
-        //     // 直接把 RGA 处理好的 rgb_buf 喂给特征提取模型
-        //     ret = run_imgenc(&rknn_app_ctx, rgb_buf.data(), img_vec.data());
-
-        //     std::cout << "--> DEBUG 7: run_imgenc 结束" << std::endl;
-        //     if (ret != 0) {
-        //         printf("run_imgenc fail! ret=%d\n", ret);
-        //     }
-        //     rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
-        //     rkllm_input.role = "user";
-        //     rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
-        //     rkllm_input.multimodal_input.image_embed = img_vec.data();
-        //     rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
-        //     rkllm_input.multimodal_input.n_image = 1;
-        //     rkllm_input.multimodal_input.image_height = image_height;
-        //     rkllm_input.multimodal_input.image_width = image_width;
+       
             std::cout << "--> DEBUG 3: 启动 RGA 硬件加速 (处理 Stride 对齐)" << std::endl;
             
             size_t image_width = rknn_app_ctx.model_width;   // 392
@@ -533,7 +575,7 @@ int main(int argc, char** argv)
             int dy = (image_height - scaled_h) / 2;
 
             // 4. 构建 RGA 内存描述符 (使用完整参数列表，显式指定 dst 的 wstride 为 aligned_w)
-            rga_buffer_t src = wrapbuffer_virtualaddr((void*)nv12_img.data, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
+            rga_buffer_t src = wrapbuffer_fd(process_fd, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
             // 参数列表: vir_addr, width, height, format, wstride, hstride
             rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, aligned_w, image_height);
 
@@ -548,6 +590,25 @@ int main(int argc, char** argv)
             IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
             if (rga_stat != IM_STATUS_SUCCESS) {
                 printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
+            }
+            {
+                std::lock_guard<std::mutex> lock(camera_mutex);
+                
+                CS.buffers[process_id].in_use_by_llm=false;
+                struct v4l2_plane qplanes[1];
+                struct v4l2_buffer qbuf;
+                memset(&qbuf, 0, sizeof(qbuf));
+                memset(qplanes, 0, sizeof(qplanes));
+                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qbuf.memory = V4L2_MEMORY_MMAP;
+                qbuf.index=process_id;
+                qbuf.length = 1;
+                qbuf.m.planes = qplanes;
+                if(last_held_index==process_id)last_held_index=-1;
+                if (ioctl(CS.fd, VIDIOC_QBUF, &qbuf) < 0) {
+                    // 如果没拿到，稍微等一下继续尝试，防止死循环占满 CPU
+                    perror("[ERROR] VIDIOC_QBUF failed in thread");
+                }
             }
 
             // 5. 内存重排 (Memory Repacking)
@@ -597,6 +658,8 @@ int main(int argc, char** argv)
         delete camera_thread;
         camera_thread = nullptr;
     }
+    std::cout << "[INFO] 恢复 CPU 动态调频模式 (schedutil)..." << std::endl;
+    system("echo schedutil | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor > /dev/null");
     rkllm_destroy(llmHandle);
     release_camera();
 
