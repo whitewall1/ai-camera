@@ -41,36 +41,8 @@
 #define IMG_HEIGHT 1080
 using namespace std;
 LLMHandle llmHandle = nullptr;
-//-----------------------------------------multi_thread------------------------------------------------
-// 多线程全局控制变量
-//std::mutex camera_mutex;              // 互斥锁：保证同一时间只有一个人能碰图片
-//cv::Mat latest_nv12_frame;            // 共享内存：永远存放最新的一帧原始 NV12 图片
-//std::atomic<bool> keep_running{true}; // 线程开关：当它变成 false 时，抓图线程就会乖乖退出
-//std::thread* camera_thread = nullptr; // 指向我们后台抓图线程的指针
-// 将当前线程绑定到指定的 CPU 核心范围 (例如：起始核0，结束核3)
-bool bind_thread_to_cpus(int start_core, int end_core) {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    
-    for (int i = start_core; i <= end_core; ++i) {
-        CPU_SET(i, &cpuset);
-    }
-
-    pthread_t current_thread = pthread_self();
-    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
-    
-    if (rc != 0) {
-        std::cerr << "[Warning] Error calling pthread_setaffinity_np: " << rc << std::endl;
-        return false;
-    }
-    
-    std::cout << "[INFO] 成功将线程绑定到 CPU " << start_core << " ~ " << end_core << std::endl;
-    return true;
-}
-//-----------------------------------------camera--------------------------------
 // -------------------- 新增：DMA-BUF 与多线程控制 --------------------
 #define BUFFER_COUNT 4 // 申请 4 个 Buffer，保证流水线不卡死
-
 struct CameraBuffer {
     int index;           // Buffer 序号
     int fd;              // 导出的 DMA-BUF 文件描述符
@@ -91,15 +63,40 @@ int latest_buf_index = -1;            // 共享变量：永远存放最新一帧
 int last_held_index=-1;
 std::atomic<bool> keep_running{true}; // 线程开关
 std::thread* camera_thread = nullptr;
-// struct CameraState {
-//     int fd;
-//     struct v4l2_buffer buf;
-//     struct v4l2_plane planes[1]; // 修复：必须存在全局结构体里，否则会变成悬空指针
-//     void* buffer_start;
-//     unsigned int buffer_length;  // 修复：记录长度，方便 munmap 时使用
-// };
+// -------------------- 新增：视觉特征共享区 --------------------
+std::mutex vision_mutex;                  // 保护视觉特征的互斥锁
+std::vector<float> global_img_embed;      // 全局特征向量（存放 run_imgenc 的结果）
+bool is_vision_ready = false;             // 标志位：第一帧是否已经处理完毕
+std::atomic<bool> vision_thread_running{true}; // 视觉线程的开关
+std::thread* vision_thread = nullptr;     // 视觉线程指针
+std::atomic<bool> is_llm_generating{false}; // 新增：标记 LLM 是否正在说话
+// --------------------------------------------------------------
+//-----------------------------------------multi_thread------------------------------------------------
 
-//struct CameraState CS;
+bool bind_thread_to_cpus(int start_core, int end_core) {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    
+    for (int i = start_core; i <= end_core; ++i) {
+        CPU_SET(i, &cpuset);
+    }
+
+    pthread_t current_thread = pthread_self();
+    int rc = pthread_setaffinity_np(current_thread, sizeof(cpu_set_t), &cpuset);
+    
+    if (rc != 0) {
+        std::cerr << "[Warning] Error calling pthread_setaffinity_np: " << rc << std::endl;
+        return false;
+    }
+    
+    std::cout << "[INFO] 成功将线程绑定到 CPU " << start_core << " ~ " << end_core << std::endl;
+    return true;
+}
+//-----------------------------------------camera--------------------------------
+
+
+
+
 
 bool init_camera() {
     CS.fd = open(VIDEO_NODE, O_RDWR); // 直接存入 CS.fd
@@ -123,18 +120,7 @@ bool init_camera() {
         return false;
     }
 
-    // 3. Request Buffers
-    // struct v4l2_requestbuffers req;
-    // memset(&req, 0, sizeof(req));
-    // req.count = 1;
-    // req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    // req.memory = V4L2_MEMORY_MMAP;
-
-    // if (ioctl(CS.fd, VIDIOC_REQBUFS, &req) < 0) {
-    //     perror("[ERROR] VIDIOC_REQBUFS failed");
-    //     close(CS.fd);
-    //     return false;
-    // }
+    
     struct v4l2_requestbuffers req;
     memset(&req, 0, sizeof(req));
     req.count = BUFFER_COUNT; // 【改动1】从 1 改成 BUFFER_COUNT (也就是 4)
@@ -196,35 +182,7 @@ bool init_camera() {
             return false;
         }
     }
-    // memset(&CS.buf, 0, sizeof(CS.buf));
-    // memset(CS.planes, 0, sizeof(CS.planes)); // 初始化结构体里的 planes
-    // CS.buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    // CS.buf.memory = V4L2_MEMORY_MMAP;
-    // CS.buf.index = 0;
-    // CS.buf.length = 1; 
-    // CS.buf.m.planes = CS.planes; // 安全绑定！
-
-    // if (ioctl(CS.fd, VIDIOC_QUERYBUF, &CS.buf) < 0) {
-    //     perror("[ERROR] VIDIOC_QUERYBUF failed");
-    //     close(CS.fd);
-    //     return false;
-    // }
-
-    // CS.buffer_length = CS.buf.m.planes[0].length;
-    // CS.buffer_start = mmap(NULL, CS.buffer_length, PROT_READ | PROT_WRITE, 
-    //                        MAP_SHARED, CS.fd, CS.buf.m.planes[0].m.mem_offset);
-                           
-    // if (CS.buffer_start == MAP_FAILED) {
-    //     perror("[ERROR] mmap failed");
-    //     close(CS.fd);
-    //     return false;
-    // }
-
-    // 重点：开流(STREAMON)之前，先要把缓存(QBUF)交给底层，让它有地方存第一张图！
-    // if (ioctl(CS.fd, VIDIOC_QBUF, &CS.buf) < 0) {
-    //     perror("[ERROR] VIDIOC_QBUF failed");
-    //     return false;
-    // }
+    
 
     // 5. Stream on
     int type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
@@ -313,7 +271,105 @@ void release_camera() {
     std::cout << "[INFO] Camera resources and DMA-BUFs released safely." << std::endl;
 }
 //-----------------------------------------camera-end----------------------------
+// 视觉处理线程：在后台默默把最新的画面转成 LLM 特征
+void vision_worker_func(rknn_app_context_t* app_ctx) {
+    // 建议绑定到 NPU 所在的相同集群，或者留给系统的调度器
+    bind_thread_to_cpus(4, 5); 
+    std::cout << "[INFO] 视觉处理线程已启动，开始后台特征提取..." << std::endl;
 
+    size_t n_image_tokens = app_ctx->model_image_token;
+    size_t image_embed_len = app_ctx->model_embed_size;
+    int rkllm_image_embed_len = n_image_tokens * image_embed_len;
+    
+    // 局部特征缓存
+    std::vector<float> local_img_vec(rkllm_image_embed_len);
+
+    while (vision_thread_running && keep_running) {
+        if (is_llm_generating) {
+            // 如果 LLM 正在疯狂输出文字，我们就休眠，把算力和内存带宽全让给它！
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue; 
+        }
+        int process_id = -1;
+        int process_fd = -1;
+
+        // 1. 从摄像头获取最新的帧
+        {
+            std::lock_guard<std::mutex> lock(camera_mutex);
+            if (latest_buf_index != -1) {
+                process_id = latest_buf_index;
+                process_fd = CS.buffers[latest_buf_index].fd;
+                CS.buffers[latest_buf_index].in_use_by_llm = true; // 锁定这帧画面
+            }
+        }
+
+        if (process_id != -1) {
+            // --- 这里完全复用你之前的 RGA 和内存重排逻辑 ---
+            size_t image_width = app_ctx->model_width;   // 392
+            size_t image_height = app_ctx->model_height; // 392
+            int aligned_w = (image_width + 15) & (~15);
+
+            std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
+            memset(rga_buf.data(), 127, aligned_w * image_height * 3);
+
+            int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
+            float scale = (float)image_width / max_dim; 
+            int scaled_w = IMG_WIDTH * scale;
+            int scaled_h = IMG_HEIGHT * scale;
+            int dx = (image_width - scaled_w) / 2;
+            int dy = (image_height - scaled_h) / 2;
+
+            rga_buffer_t src = wrapbuffer_fd(process_fd, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
+            rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, aligned_w, image_height);
+            im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; 
+            im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  
+            rga_buffer_t empty_pat;
+            memset(&empty_pat, 0, sizeof(empty_pat));
+            im_rect empty_rect = {0, 0, 0, 0};
+
+            // 执行 RGA
+            improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
+
+            // 内存重排
+            cv::Mat rga_mat(image_height, aligned_w, CV_8UC3, rga_buf.data());
+            cv::Mat packed_mat = rga_mat(cv::Rect(0, 0, image_width, image_height)).clone();
+
+            // 释放这帧摄像头 Buffer (重要！)
+            {
+                std::lock_guard<std::mutex> lock(camera_mutex);
+                CS.buffers[process_id].in_use_by_llm = false;
+                struct v4l2_buffer qbuf;
+                struct v4l2_plane qplanes[1];
+                memset(&qbuf, 0, sizeof(qbuf));
+                memset(qplanes, 0, sizeof(qplanes));
+                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+                qbuf.memory = V4L2_MEMORY_MMAP;
+                qbuf.index = process_id;
+                qbuf.length = 1;
+                qbuf.m.planes = qplanes;
+                if(last_held_index == process_id) last_held_index = -1;
+                ioctl(CS.fd, VIDIOC_QBUF, &qbuf);
+            }
+
+            // 2. 执行 NPU 视觉编码
+            int ret = run_imgenc(app_ctx, packed_mat.data, local_img_vec.data());
+            if (ret != 0) {
+                printf("[ERROR] run_imgenc fail! ret=%d\n", ret);
+            }
+
+            // 3. 把算好的特征放入“保险箱”
+            {
+                std::lock_guard<std::mutex> lock(vision_mutex);
+                global_img_embed = local_img_vec; // 拷贝给全局变量
+                is_vision_ready = true;
+            }
+        } else {
+            // 如果没抓到图，稍微等一下
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    std::cout << "[INFO] 视觉处理线程已退出。" << std::endl;
+}
 
 
 void exit_handler(int signal)
@@ -466,6 +522,8 @@ int main(int argc, char** argv)
         printf("init_imgenc fail! ret=%d model_path=%s\n", ret, encoder_model_path);
         return -1;
     }
+    // -------------------- 新增：启动视觉处理线程 --------------------
+    vision_thread = new std::thread(vision_worker_func, &rknn_app_ctx);
     t_load_end_us = std::chrono::high_resolution_clock::now();
 
     load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
@@ -534,114 +592,51 @@ int main(int argc, char** argv)
             rkllm_input.role = "user";
             rkllm_input.prompt_input = (char*)input_str.c_str();
         } else {
-           
-            std::cout << "[INFO] 侦测到 <image> 标签，正在从共享内存获取最新画面..." << std::endl;
-            int process_id=-1;
-            int process_fd=-1;
-            cv::Mat nv12_img;
-            {
-                // 1. 加锁：去全局变量里拿图，防止抓图线程此时正好在写入导致图像撕裂
-                std::lock_guard<std::mutex> lock(camera_mutex);
-                if (latest_buf_index==-1) {
-                    std::cout << "[WARNING] 后台还没抓到图，请稍后再试！" << std::endl;
-                    continue;
-                }
-                // 2. 深拷贝出来给主线程用。因为都在内存里，这步极快！
-                process_id=latest_buf_index;
-                process_fd=CS.buffers[latest_buf_index].fd;
-                CS.buffers[latest_buf_index].in_use_by_llm=true;
-            } // 大括号结束，锁自动释放！此时后台线程又可以继续疯狂抓图了。
-
-          
-       
-            std::cout << "--> DEBUG 3: 启动 RGA 硬件加速 (处理 Stride 对齐)" << std::endl;
+        
+        std::cout << "[INFO] 侦测到 <image> 标签，正在从特征共享区获取最新视觉特征..." << std::endl;
             
+            // 重新声明宽高（因为把前面的一大串删了，这里需要保留参数赋值）
             size_t image_width = rknn_app_ctx.model_width;   // 392
             size_t image_height = rknn_app_ctx.model_height; // 392
 
-            // 1. 计算 16 字节对齐的 width stride
-            int aligned_w = (image_width + 15) & (~15); // 392 -> 400
+            auto t_feat_start = std::chrono::high_resolution_clock::now();
 
-            // 2. 申请对齐后的内存缓冲区
-            std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
-            memset(rga_buf.data(), 127, aligned_w * image_height * 3);
-
-            // 3. 计算缩放参数与 ROI 偏移
-            int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
-            float scale = (float)image_width / max_dim; 
-            int scaled_w = IMG_WIDTH * scale;
-            int scaled_h = IMG_HEIGHT * scale;
-            int dx = (image_width - scaled_w) / 2;
-            int dy = (image_height - scaled_h) / 2;
-
-            // 4. 构建 RGA 内存描述符 (使用完整参数列表，显式指定 dst 的 wstride 为 aligned_w)
-            rga_buffer_t src = wrapbuffer_fd(process_fd, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
-            // 参数列表: vir_addr, width, height, format, wstride, hstride
-            rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, aligned_w, image_height);
-
-            im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; 
-            im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  
-
-            rga_buffer_t empty_pat;
-            memset(&empty_pat, 0, sizeof(empty_pat));
-            im_rect empty_rect = {0, 0, 0, 0};
-            auto t_rga_start = std::chrono::high_resolution_clock::now();
-            // 执行 RGA 硬件加速
-            IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
-            if (rga_stat != IM_STATUS_SUCCESS) {
-                printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
-            }
             {
-                std::lock_guard<std::mutex> lock(camera_mutex);
+                // 加锁，打开特征“保险箱”
+                std::lock_guard<std::mutex> lock(vision_mutex);
                 
-                CS.buffers[process_id].in_use_by_llm=false;
-                struct v4l2_plane qplanes[1];
-                struct v4l2_buffer qbuf;
-                memset(&qbuf, 0, sizeof(qbuf));
-                memset(qplanes, 0, sizeof(qplanes));
-                qbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-                qbuf.memory = V4L2_MEMORY_MMAP;
-                qbuf.index=process_id;
-                qbuf.length = 1;
-                qbuf.m.planes = qplanes;
-                if(last_held_index==process_id)last_held_index=-1;
-                if (ioctl(CS.fd, VIDIOC_QBUF, &qbuf) < 0) {
-                    // 如果没拿到，稍微等一下继续尝试，防止死循环占满 CPU
-                    perror("[ERROR] VIDIOC_QBUF failed in thread");
+                if (!is_vision_ready) {
+                    std::cout << "[WARNING] 后台视觉特征尚未初始化，请稍等一两秒再试！" << std::endl;
+                    continue; // 还没算好第一帧，重新等待输入
                 }
+                
+                // 将算好的特征深拷贝给主线程的 img_vec。
+                // 拷贝极快（几千个float而已），拷贝完锁就释放，不耽误后台继续更新
+                img_vec = global_img_embed; 
             }
 
-            // 5. 内存重排 (Memory Repacking)
-            // rga_buf 当前步长为 400，存在无效 Padding。
-            // 映射为 Mat 并裁切 392x392 区域，clone() 会强制分配一块紧凑连续的内存。
-            cv::Mat rga_mat(image_height, aligned_w, CV_8UC3, rga_buf.data());
-            cv::Mat packed_mat = rga_mat(cv::Rect(0, 0, image_width, image_height)).clone();
-            auto t_rga_end = std::chrono::high_resolution_clock::now();
-            std::cout << "--> DEBUG 6: 准备 run_imgenc" << std::endl;
-            // 传入去除了 Padding 的连续内存指针 packed_mat.data
-            ret = run_imgenc(&rknn_app_ctx, packed_mat.data, img_vec.data());
-            auto t_npu_end = std::chrono::high_resolution_clock::now();
-            if (ret != 0) {
-                printf("run_imgenc fail! ret=%d\n", ret);
-            }
-            
+            auto t_feat_end = std::chrono::high_resolution_clock::now();
+            auto feat_cost = std::chrono::duration_cast<std::chrono::microseconds>(t_feat_end - t_feat_start).count();
+            std::cout << " -> 从后台获取最新视觉特征耗时: " << feat_cost << " us (微秒级!)" << std::endl;
+
+            // 直接打包输入给 LLM，跳过所有 RGA 和 ImgEnc 的漫长等待
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.role = "user";
             rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
-            rkllm_input.multimodal_input.image_embed = img_vec.data();
+            rkllm_input.multimodal_input.image_embed = img_vec.data(); // 指向刚拿到的特征
             rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
             rkllm_input.multimodal_input.n_image = 1;
             rkllm_input.multimodal_input.image_height = image_height;
             rkllm_input.multimodal_input.image_width = image_width;
-            auto rga_cost = std::chrono::duration_cast<std::chrono::milliseconds>(t_rga_end - t_rga_start).count();
-            auto npu_cost = std::chrono::duration_cast<std::chrono::milliseconds>(t_npu_end - t_rga_end).count();
             
-            std::cout << "\n[异构流水线打点]" << std::endl;
-            std::cout << " -> RGA 预处理耗时: " << rga_cost << " ms" << std::endl;
-            std::cout << " -> NPU 视觉编码耗时: " << npu_cost << " ms" << std::endl;
-        }
+        } // 这是原本代码里 else 分支的结束括号
+
         printf("robot: ");
+        // 1. 开关打开，命令视觉线程挂起！
+        is_llm_generating = true;
         rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+        // 3. LLM 说完话了，开关关闭，让视觉线程继续干活
+        is_llm_generating = false;
         auto t_end = std::chrono::high_resolution_clock::now();
         auto cost_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
         std::cout << "\n[性能打点] 从接收指令到生成完毕总耗时: " << cost_time_ms << " ms"<<std::endl;
