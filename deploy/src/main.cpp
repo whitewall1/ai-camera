@@ -36,13 +36,15 @@
 #include <csignal>
 #include "im2d.h"
 #include "rga.h"
-#define VIDEO_NODE "/dev/video9"
+#include <queue>
+#include <condition_variable>
+#define VIDEO_NODE "/dev/video16"
 #define IMG_WIDTH  1920
 #define IMG_HEIGHT 1080
 using namespace std;
 LLMHandle llmHandle = nullptr;
 // -------------------- 新增：DMA-BUF 与多线程控制 --------------------
-#define BUFFER_COUNT 4 // 申请 4 个 Buffer，保证流水线不卡死
+#define BUFFER_COUNT 8 // 申请 4 个 Buffer，保证流水线不卡死
 struct CameraBuffer {
     int index;           // Buffer 序号
     int fd;              // 导出的 DMA-BUF 文件描述符
@@ -71,6 +73,12 @@ std::atomic<bool> vision_thread_running{true}; // 视觉线程的开关
 std::thread* vision_thread = nullptr;     // 视觉线程指针
 std::atomic<bool> is_llm_generating{false}; // 新增：标记 LLM 是否正在说话
 // --------------------------------------------------------------
+// -------------------- 新增：任务队列与通信组件 --------------------
+std::queue<std::string> prompt_queue;     // 存放用户输入的任务队列
+std::mutex queue_mutex;                   // 保护队列的互斥锁
+std::condition_variable queue_cv;         // 条件变量：用于唤醒 LLM 线程
+std::thread* llm_thread = nullptr;        // LLM 推理线程指针
+// ------------------------------------------------------------------
 //-----------------------------------------multi_thread------------------------------------------------
 
 bool bind_thread_to_cpus(int start_core, int end_core) {
@@ -204,6 +212,7 @@ void camera_thread_func() {
     std::cout << "[INFO] 后台抓图线程已启动..." << std::endl;
     
     while (keep_running) {
+        
         // 1. DQBUF (从底层硬件拿到装满画面的 buffer)
         struct v4l2_plane planes[1];
         struct v4l2_buffer buf;
@@ -276,13 +285,39 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
     // 建议绑定到 NPU 所在的相同集群，或者留给系统的调度器
     bind_thread_to_cpus(4, 5); 
     std::cout << "[INFO] 视觉处理线程已启动，开始后台特征提取..." << std::endl;
-
+// ---------------------------------------------------------
+    // 优化 1：把所有【常量】和【内存分配】移出 while 循环！
+    // ---------------------------------------------------------
     size_t n_image_tokens = app_ctx->model_image_token;
     size_t image_embed_len = app_ctx->model_embed_size;
     int rkllm_image_embed_len = n_image_tokens * image_embed_len;
     
-    // 局部特征缓存
+    size_t image_width = app_ctx->model_width;   // 392
+    size_t image_height = app_ctx->model_height; // 392
+    int aligned_w = (image_width + 15) & (~15);  // 400
+
+    // 提前算好缩放和 ROI，只算一次
+    int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
+    float scale = (float)image_width / max_dim; 
+    int scaled_w = IMG_WIDTH * scale;
+    int scaled_h = IMG_HEIGHT * scale;
+    int dx = (image_width - scaled_w) / 2;
+    int dy = (image_height - scaled_h) / 2;
+
+    im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; 
+    im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  
+    rga_buffer_t empty_pat;
+    memset(&empty_pat, 0, sizeof(empty_pat));
+    im_rect empty_rect = {0, 0, 0, 0};
+
+    // 提前分配好所有的物理/虚拟内存块 (整个线程生命周期只 new 这一次)
     std::vector<float> local_img_vec(rkllm_image_embed_len);
+    std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
+    
+    // 预先包好 Mat 头，不分配新内存
+    cv::Mat rga_mat_wrapper(image_height, aligned_w, CV_8UC3, rga_buf.data());
+    // 预分配一块连续紧凑的内存，给 NPU 喂数据用
+    cv::Mat packed_mat(image_height, image_width, CV_8UC3);
 
     while (vision_thread_running && keep_running) {
         if (is_llm_generating) {
@@ -304,36 +339,39 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
         }
 
         if (process_id != -1) {
-            // --- 这里完全复用你之前的 RGA 和内存重排逻辑 ---
-            size_t image_width = app_ctx->model_width;   // 392
-            size_t image_height = app_ctx->model_height; // 392
-            int aligned_w = (image_width + 15) & (~15);
+            // ==================== 探针 1：保存 RGA 处理前（摄像头原始 NV12） ====================
+            // 你的 init_camera 里已经把 DMA-BUF 映射到了虚拟内存 CS.buffers[i].start
+            // NV12 格式在内存中占用的大小是 height * width * 1.5 (即 height * 3 / 2)
+            cv::Mat yuv_mat(IMG_HEIGHT * 3 / 2, IMG_WIDTH, CV_8UC1, CS.buffers[process_id].start);
+            cv::Mat src_bgr;
+            // 将 NV12 转为 OpenCV 认识的 BGR 格式用于正常保存和预览
+            cv::cvtColor(yuv_mat, src_bgr, cv::COLOR_YUV2BGR_NV12);
 
-            std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
+            auto now = std::chrono::system_clock::now();
+            auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+            std::time_t t = std::chrono::system_clock::to_time_t(now);
+            std::tm tm = *std::localtime(&t);
+            char time_buf[64];
+            std::strftime(time_buf, sizeof(time_buf), "%H-%M-%S", &tm);
+            std::string time_str = std::string(time_buf) + "_" + std::to_string(ms.count());
+
+            std::string before_name = "debug_before_" + time_str + ".jpg";
+            cv::imwrite(before_name, src_bgr);
+            // ==============================================================================
             memset(rga_buf.data(), 127, aligned_w * image_height * 3);
 
-            int max_dim = std::max(IMG_WIDTH, IMG_HEIGHT);
-            float scale = (float)image_width / max_dim; 
-            int scaled_w = IMG_WIDTH * scale;
-            int scaled_h = IMG_HEIGHT * scale;
-            int dx = (image_width - scaled_w) / 2;
-            int dy = (image_height - scaled_h) / 2;
 
             rga_buffer_t src = wrapbuffer_fd(process_fd, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
             rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, aligned_w, image_height);
-            im_rect src_rect = {0, 0, IMG_WIDTH, IMG_HEIGHT}; 
-            im_rect dst_rect = {dx, dy, scaled_w, scaled_h};  
-            rga_buffer_t empty_pat;
-            memset(&empty_pat, 0, sizeof(empty_pat));
-            im_rect empty_rect = {0, 0, 0, 0};
+           
 
             // 执行 RGA
-            improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
-
-            // 内存重排
-            cv::Mat rga_mat(image_height, aligned_w, CV_8UC3, rga_buf.data());
-            cv::Mat packed_mat = rga_mat(cv::Rect(0, 0, image_width, image_height)).clone();
-
+            IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
+            if (rga_stat != IM_STATUS_SUCCESS) {
+                printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
+            }
+           rga_mat_wrapper(cv::Rect(0, 0, image_width, image_height)).copyTo(packed_mat);
+           
             // 释放这帧摄像头 Buffer (重要！)
             {
                 std::lock_guard<std::mutex> lock(camera_mutex);
@@ -347,6 +385,7 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
                 qbuf.index = process_id;
                 qbuf.length = 1;
                 qbuf.m.planes = qplanes;
+                
                 if(last_held_index == process_id) last_held_index = -1;
                 ioctl(CS.fd, VIDIOC_QBUF, &qbuf);
             }
@@ -371,7 +410,88 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
     std::cout << "[INFO] 视觉处理线程已退出。" << std::endl;
 }
 
+void llm_worker_func(rknn_app_context_t* app_ctx) {
+    // 强制绑定到 A76 大核 (例如 6, 7)，榨干大核算力
+    bind_thread_to_cpus(6, 7);
+    std::cout << "[INFO] LLM 推理线程已启动，进入深度睡眠等待任务..." << std::endl;
 
+    size_t n_image_tokens = app_ctx->model_image_token;
+    size_t image_width = app_ctx->model_width;
+    size_t image_height = app_ctx->model_height;
+
+    // 线程内维护一份自己的特征向量副本来防止竞争
+    std::vector<float> local_img_vec;
+
+    RKLLMInput rkllm_input;
+    memset(&rkllm_input, 0, sizeof(RKLLMInput));
+    RKLLMInferParam rkllm_infer_params;
+    memset(&rkllm_infer_params, 0, sizeof(RKLLMInferParam));
+    rkllm_infer_params.mode = RKLLM_INFER_GENERATE;
+
+    while (keep_running) {
+        std::string current_prompt;
+
+        // 1. 等待任务：无锁时绝对睡眠，0% CPU 占用
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex);
+            // 铃铛没响，且队列为空时，死死睡住
+            queue_cv.wait(lock, []{ return !prompt_queue.empty() || !keep_running; });
+            
+            if (!keep_running && prompt_queue.empty()) {
+                break; // 收到退出信号，安全结束线程
+            }
+
+            // 拿到任务，出队
+            current_prompt = prompt_queue.front();
+            prompt_queue.pop();
+        }
+
+        auto t_start = std::chrono::high_resolution_clock::now();
+
+        // 2. 解析任务并准备输入
+        if (current_prompt.find("<image>") != std::string::npos) {
+            auto t_feat_start = std::chrono::high_resolution_clock::now();
+            {
+                std::lock_guard<std::mutex> lock(vision_mutex);
+                if (!is_vision_ready) {
+                    std::cout << "[WARNING] 后台视觉特征尚未初始化，跳过此次多模态推理！" << std::endl;
+                    std::cout << "\nuser: " << std::flush;
+                    continue; 
+                }
+                local_img_vec = global_img_embed; // 极速深拷贝（微秒级）
+            }
+            auto feat_cost = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t_feat_start).count();
+            std::cout << " -> 从后台获取最新视觉特征耗时: " << feat_cost << " us" << std::endl;
+
+            rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
+            rkllm_input.multimodal_input.prompt = (char*)current_prompt.c_str();
+            rkllm_input.multimodal_input.image_embed = local_img_vec.data();
+            rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
+            rkllm_input.multimodal_input.n_image = 1;
+            rkllm_input.multimodal_input.image_height = image_height;
+            rkllm_input.multimodal_input.image_width = image_width;
+        } else {
+            rkllm_input.input_type = RKLLM_INPUT_PROMPT;
+            rkllm_input.prompt_input = (char*)current_prompt.c_str();
+        }
+        rkllm_input.role = "user";
+
+        // 3. 执行核心推理
+        printf("robot: ");
+        
+        is_llm_generating = true; // 【极其关键】抢占 NPU，让视觉线程挂起闭嘴
+        rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
+        is_llm_generating = false; // 推理结束，松开刹车，视觉线程恢复常态感知
+
+        auto t_end = std::chrono::high_resolution_clock::now();
+        auto cost_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
+        std::cout << "\n[性能打点] 推理总耗时: " << cost_time_ms << " ms" << std::endl;
+        
+        // 打印出新的交互提示符，因为主线程可能早就等在那里了
+        std::cout << "\nuser: " << std::flush; 
+    }
+    std::cout << "[INFO] LLM 推理线程已退出。" << std::endl;
+}
 void exit_handler(int signal)
 {
     std::cout << "\n[INFO] 接收到退出信号 (比如 Ctrl+C)，准备清理现场..." << std::endl;
@@ -524,6 +644,7 @@ int main(int argc, char** argv)
     }
     // -------------------- 新增：启动视觉处理线程 --------------------
     vision_thread = new std::thread(vision_worker_func, &rknn_app_ctx);
+    llm_thread = new std::thread(llm_worker_func, &rknn_app_ctx);
     t_load_end_us = std::chrono::high_resolution_clock::now();
 
     load_time = std::chrono::duration_cast<std::chrono::microseconds>(t_load_end_us - t_start_us);
@@ -561,100 +682,79 @@ int main(int argc, char** argv)
 
     while(true) {
         std::string input_str;
-        printf("\n");
-        printf("user: ");
         std::getline(std::cin, input_str);
-        if (input_str == "exit")
-        {
-            break;
+        
+        if (input_str == "exit") {
+            break; // 触发退出流程
         }
-        if (input_str == "clear")
-        {
+        if (input_str == "clear") {
             ret = rkllm_clear_kv_cache(llmHandle, 1, nullptr, nullptr);
-            if (ret != 0)
-            {
-                printf("clear kv cache failed!\n");
-            }
+            if (ret != 0) printf("clear kv cache failed!\n");
+            printf("user: ");
             continue;
         }
-        for (int i = 0; i < (int)pre_input.size(); i++)
-        {
-            if (input_str == to_string(i))
-            {
+
+        // 处理快捷数字输入
+        for (int i = 0; i < (int)pre_input.size(); i++) {
+            if (input_str == to_string(i)) {
                 input_str = pre_input[i];
                 cout << input_str << endl;
             }
         }
-        auto t_start = std::chrono::high_resolution_clock::now();
-        if (input_str.find("<image>") == std::string::npos) 
+
+        // 将任务推入队列，并敲响铃铛唤醒 LLM 线程！
         {
-            rkllm_input.input_type = RKLLM_INPUT_PROMPT;
-            rkllm_input.role = "user";
-            rkllm_input.prompt_input = (char*)input_str.c_str();
-        } else {
-        
-        std::cout << "[INFO] 侦测到 <image> 标签，正在从特征共享区获取最新视觉特征..." << std::endl;
-            
-            // 重新声明宽高（因为把前面的一大串删了，这里需要保留参数赋值）
-            size_t image_width = rknn_app_ctx.model_width;   // 392
-            size_t image_height = rknn_app_ctx.model_height; // 392
+            std::lock_guard<std::mutex> lock(queue_mutex);
+            prompt_queue.push(input_str);
+        }
+        queue_cv.notify_one(); 
 
-            auto t_feat_start = std::chrono::high_resolution_clock::now();
-
-            {
-                // 加锁，打开特征“保险箱”
-                std::lock_guard<std::mutex> lock(vision_mutex);
-                
-                if (!is_vision_ready) {
-                    std::cout << "[WARNING] 后台视觉特征尚未初始化，请稍等一两秒再试！" << std::endl;
-                    continue; // 还没算好第一帧，重新等待输入
-                }
-                
-                // 将算好的特征深拷贝给主线程的 img_vec。
-                // 拷贝极快（几千个float而已），拷贝完锁就释放，不耽误后台继续更新
-                img_vec = global_img_embed; 
-            }
-
-            auto t_feat_end = std::chrono::high_resolution_clock::now();
-            auto feat_cost = std::chrono::duration_cast<std::chrono::microseconds>(t_feat_end - t_feat_start).count();
-            std::cout << " -> 从后台获取最新视觉特征耗时: " << feat_cost << " us (微秒级!)" << std::endl;
-
-            // 直接打包输入给 LLM，跳过所有 RGA 和 ImgEnc 的漫长等待
-            rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
-            rkllm_input.role = "user";
-            rkllm_input.multimodal_input.prompt = (char*)input_str.c_str();
-            rkllm_input.multimodal_input.image_embed = img_vec.data(); // 指向刚拿到的特征
-            rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
-            rkllm_input.multimodal_input.n_image = 1;
-            rkllm_input.multimodal_input.image_height = image_height;
-            rkllm_input.multimodal_input.image_width = image_width;
-            
-        } // 这是原本代码里 else 分支的结束括号
-
-        printf("robot: ");
-        // 1. 开关打开，命令视觉线程挂起！
-        is_llm_generating = true;
-        rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
-        // 3. LLM 说完话了，开关关闭，让视觉线程继续干活
-        is_llm_generating = false;
-        auto t_end = std::chrono::high_resolution_clock::now();
-        auto cost_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
-        std::cout << "\n[性能打点] 从接收指令到生成完毕总耗时: " << cost_time_ms << " ms"<<std::endl;
+        // 注意：这里不需要再打 "user: " 了，因为大模型还没说完，打印标志位的事情交给 llm_worker 去做。
     }
 
+    
+    // --- 新增：安全关闭所有后台线程 ---
+    
+    keep_running = false; 
+    vision_thread_running = false; 
+    queue_cv.notify_all(); 
+
+    // ---------------------------------------------------------
+    // 第二步：等待所有打工人（子线程）安全下班
+    // ---------------------------------------------------------
+    if (camera_thread && camera_thread->joinable()) {
+        camera_thread->join(); 
+        delete camera_thread;
+        camera_thread = nullptr;
+        std::cout << "[清理] 摄像头抓图线程已回收。" << std::endl;
+    }
+
+    if (vision_thread && vision_thread->joinable()) {
+        vision_thread->join(); 
+        delete vision_thread;
+        vision_thread = nullptr;
+        std::cout << "[清理] 视觉预热线程已回收。" << std::endl;
+    }
+
+    if (llm_thread && llm_thread->joinable()) {
+        llm_thread->join(); 
+        delete llm_thread;
+        llm_thread = nullptr;
+        std::cout << "[清理] LLM 推理线程已回收。" << std::endl;
+    }
+
+    // ---------------------------------------------------------
+    // 第三步：人走空了，可以安全地拆厂房（释放底层驱动资源）
+    // ---------------------------------------------------------
+    std::cout << "[INFO] 恢复 CPU 动态调频模式 (schedutil)..." << std::endl;
+    system("echo schedutil | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor > /dev/null");
+    
+    // 把 release_imgenc 移到了这里！此时 vision_thread 已经死透了，绝对安全
     ret = release_imgenc(&rknn_app_ctx);
     if (ret != 0) {
         printf("release_imgenc fail! ret=%d\n", ret);
     }
-    // --- 新增：安全关闭后台线程 ---
-    keep_running = false; // 告诉后台线程循环该结束了
-    if (camera_thread && camera_thread->joinable()) {
-        camera_thread->join(); // 等待后台线程安全结束最后一轮循环
-        delete camera_thread;
-        camera_thread = nullptr;
-    }
-    std::cout << "[INFO] 恢复 CPU 动态调频模式 (schedutil)..." << std::endl;
-    system("echo schedutil | tee /sys/devices/system/cpu/cpufreq/policy*/scaling_governor > /dev/null");
+    
     rkllm_destroy(llmHandle);
     release_camera();
 
