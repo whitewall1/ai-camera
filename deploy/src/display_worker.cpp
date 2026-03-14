@@ -11,6 +11,7 @@
 // RGA 相关头文件
 #include "im2d.h"
 #include "rga.h"
+
 void display_worker_func() {
     bind_thread_to_cpus(2, 3); // 绑定到小核，把大核全留给模型
     //std::cout << "[INFO] DRM 显示线程已启动，开启 RGA 硬件直通..." << std::endl;
@@ -39,13 +40,13 @@ void display_worker_func() {
     rga_buffer_t empty_pat;
     memset(&empty_pat, 0, sizeof(empty_pat));
     uint32_t overlay_fb_id = 0;
-    void* overlay_map_ptr = display.create_overlay_plane(&overlay_fb_id);
+    bool overlay_map_ptr = display.create_overlay_plane();
 
     if (!overlay_map_ptr) {
         std::cerr << "[ERROR] 无法开辟透明 UI 图层，LVGL 启动失败！" << std::endl;
     } else {
         // 把这块隐形玻璃的画笔 (overlay_map_ptr) 交给 LVGL 线程
-        std::thread lvgl_thread(lvgl_worker_func, overlay_map_ptr, 1024, 600);
+        std::thread lvgl_thread(lvgl_worker_func, 1024, 600);
         lvgl_thread.detach(); // 让 UI 线程在后台独立运转
     }
     while (keep_running) {

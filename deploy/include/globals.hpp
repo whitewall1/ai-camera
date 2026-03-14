@@ -62,3 +62,6 @@ extern std::condition_variable queue_cv;
 // 用于 LLM 和 LVGL 之间的跨线程文本通讯
 extern std::string current_llm_response;
 extern std::mutex llm_response_mutex;
+
+extern uint32_t g_drm_fb_ids[2];   // 存两个 Framebuffer 的 ID，给显卡用的
+extern void* g_drm_map_ptrs[2];    // 存两个 mmap 出来的虚拟指针，给 LVGL 用的

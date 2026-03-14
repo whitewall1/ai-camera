@@ -17,7 +17,7 @@ public:
     bool present_fb(uint32_t fb_id);
 
     // 接口 2 (新增！)：给 UI 层 (LVGL) 用的透明显存，直接返回 CPU 可写的虚拟内存指针
-    void* create_overlay_plane(uint32_t* out_fb_id);
+    bool create_overlay_plane();
 
 private:
     int drm_fd_;

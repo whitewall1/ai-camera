@@ -11,7 +11,8 @@
 #include <linux/input.h>
 #include <fcntl.h>
 #include <unistd.h>
-
+#include <xf86drm.h>       // 解决 drmModeSetPlane 找不到的报错 7
+#include <xf86drmMode.h>
 // 声明我们刚刚生成的离线中文字库
 LV_FONT_DECLARE(lv_font_cn_16);
 
@@ -21,7 +22,13 @@ static int evdev_fd = -1;
 static int32_t last_x = 0;
 static int32_t last_y = 0;
 static lv_indev_state_t last_state = LV_INDEV_STATE_REL;
-
+extern uint32_t g_drm_fb_ids[2];
+extern void* g_drm_map_ptrs[2];
+extern int      g_drm_fd;             // 全局 DRM 句柄
+extern uint32_t g_overlay_plane_id;   // 全局透明图层 ID
+extern uint32_t g_crtc_id;            // 全局显示控制器 ID
+extern uint32_t g_screen_width;       // 全局屏幕宽
+extern uint32_t g_screen_height;      // 全局屏幕高
 // ==========================================================
 // 触摸屏与显存底层驱动
 // ==========================================================
@@ -48,14 +55,36 @@ static void touch_read_cb(lv_indev_drv_t * indev_drv, lv_indev_data_t * data) {
 }
 
 static void drm_disp_flush_cb(lv_disp_drv_t * disp_drv, const lv_area_t * area, lv_color_t * color_p) {
-    if (!g_drm_map_ptr) { lv_disp_flush_ready(disp_drv); return; }
-    int32_t x1 = area->x1, y1 = area->y1, x2 = area->x2, y2 = area->y2;
-    uint32_t* drm_fb = static_cast<uint32_t*>(g_drm_map_ptr);
-    uint32_t* lvgl_buf = reinterpret_cast<uint32_t*>(color_p);
-    uint32_t copy_width = (x2 - x1 + 1);
-    for (int32_t y = y1; y <= y2; y++) {
-        memcpy(&drm_fb[y * g_screen_width + x1], &lvgl_buf[(y - y1) * copy_width], copy_width * sizeof(uint32_t));
+    // if (!g_drm_map_ptr) { lv_disp_flush_ready(disp_drv); return; }
+    // int32_t x1 = area->x1, y1 = area->y1, x2 = area->x2, y2 = area->y2;
+    // uint32_t* drm_fb = static_cast<uint32_t*>(g_drm_map_ptr);
+    // uint32_t* lvgl_buf = reinterpret_cast<uint32_t*>(color_p);
+    // uint32_t copy_width = (x2 - x1 + 1);
+    // for (int32_t y = y1; y <= y2; y++) {
+    //     memcpy(&drm_fb[y * g_screen_width + x1], &lvgl_buf[(y - y1) * copy_width], copy_width * sizeof(uint32_t));
+    // }
+    // lv_disp_flush_ready(disp_drv);
+    uint32_t target_fb_id=0;
+    if(color_p==g_drm_map_ptrs[0]){
+        target_fb_id=g_drm_fb_ids[0];
+    }else{
+        target_fb_id=g_drm_fb_ids[1];
     }
+    drmModeSetPlane(
+        g_drm_fd,                // DRM 设备句柄
+        g_overlay_plane_id,      // 你的 UI 透明显存图层 ID
+        g_crtc_id,               // 显示控制器 ID
+        target_fb_id,           // 刚刚画好的那一帧数据的 ID
+        0,                      // flags
+        0, 0,                   // 屏幕目标 X, Y 坐标
+        g_screen_width,         // 屏幕目标宽度
+        g_screen_height,        // 屏幕目标高度
+        0, 0,                   // 源图 X, Y (定点数格式)
+        g_screen_width << 16,   // 源图宽度 (Q16.16 格式)
+        g_screen_height << 16   // 源图高度 (Q16.16 格式)
+    );
+
+    // 3. 汇报交工：告诉 LVGL 引擎，显卡指针已经切过去了，你可以去另一块空闲显存上画下一帧了
     lv_disp_flush_ready(disp_drv);
 }
 
@@ -93,33 +122,33 @@ static void btn_event_cb(lv_event_t * e) {
 // ==========================================================
 // LVGL 核心工作线程
 // ==========================================================
-void lvgl_worker_func(void* drm_map_ptr, uint32_t width, uint32_t height) {
-    bind_thread_to_cpus(2, 3);
-    g_drm_map_ptr = drm_map_ptr;
+void lvgl_worker_func( uint32_t width, uint32_t height) {
+   bind_thread_to_cpus(2, 3);
     g_screen_width = width;
 
     lv_init();
     touch_init();
 
-    const uint32_t buf_size = width * height / 10;
-    static lv_color_t* buf_1 = (lv_color_t*)malloc(buf_size * sizeof(lv_color_t));
+    // --- 核心：喂入双倍物理显存 ---
     static lv_disp_draw_buf_t draw_buf;
-    lv_disp_draw_buf_init(&draw_buf, buf_1, NULL, buf_size);
-
+    lv_disp_draw_buf_init(&draw_buf, g_drm_map_ptrs[0], g_drm_map_ptrs[1], width * height);
+    
     static lv_disp_drv_t disp_drv;
     lv_disp_drv_init(&disp_drv);
     disp_drv.draw_buf = &draw_buf;
-    disp_drv.flush_cb = drm_disp_flush_cb;
-    disp_drv.hor_res = width; disp_drv.ver_res = height;
+    disp_drv.flush_cb = drm_disp_flush_cb; // 记得你的 flush_cb 里要写 drmModeSetPlane 翻页逻辑！
+    disp_drv.hor_res = width; 
+    disp_drv.ver_res = height;
     disp_drv.screen_transp = 1; 
+    disp_drv.full_refresh = 1;
     lv_disp_drv_register(&disp_drv);
-
+    
+    // 在 lv_disp_drv_register(&disp_drv); 之后，你漏掉了这部分：
     static lv_indev_drv_t indev_drv;
     lv_indev_drv_init(&indev_drv);
     indev_drv.type = LV_INDEV_TYPE_POINTER;
     indev_drv.read_cb = touch_read_cb;
     lv_indev_drv_register(&indev_drv);
-
     lv_obj_set_style_bg_opa(lv_scr_act(), 0, 0);
 
     // --- 构建流式文本输出的半透明面板 ---
@@ -164,5 +193,4 @@ void lvgl_worker_func(void* drm_map_ptr, uint32_t width, uint32_t height) {
     }
     
     if(evdev_fd >= 0) close(evdev_fd);
-    free(buf_1);
 }
