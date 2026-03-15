@@ -6,6 +6,7 @@
 #include <string>
 #include <chrono>
 #include <cstring>
+int generated_token_count=0;
 void llm_worker_func(rknn_app_context_t* app_ctx) {
     // 强制绑定到 A76 大核 (例如 6, 7)，榨干大核算力
     bind_thread_to_cpus(6, 7);
@@ -26,7 +27,7 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
 
     while (keep_running) {
         std::string current_prompt;
-
+        generated_token_count=0;
         // 1. 等待任务：无锁时绝对睡眠，0% CPU 占用
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
@@ -82,7 +83,8 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
         auto t_end = std::chrono::high_resolution_clock::now();
         auto cost_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t_end - t_start).count();
         std::cout << "\n[性能打点] 推理总耗时: " << cost_time_ms << " ms" << std::endl;
-        
+        float tps = (generated_token_count * 1000.0f) / cost_time_ms;
+std::cout << "[METRIC] LLM 生成速度: " << tps << " tokens/s (耗时: " << cost_time_ms << "ms)" << std::endl;
         // 打印出新的交互提示符，因为主线程可能早就等在那里了
         std::cout << "\nuser: " << std::flush; 
     }
@@ -91,6 +93,7 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
 // 注意参数类型和内部判断宏的改变
 int callback(RKLLMResult *result, void *userdata, LLMCallState state) {
     if (state == RKLLM_RUN_NORMAL) {
+        generated_token_count++;
         // 【核心修复】：增加严格的空指针防御，防止 basic_string::append 崩溃
         if (result != nullptr && result->text != nullptr) {
             std::lock_guard<std::mutex> lock(llm_response_mutex);

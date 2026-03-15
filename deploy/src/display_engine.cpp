@@ -198,6 +198,6 @@ bool DisplayEngine::create_overlay_plane() { // 返回值可以改成 bool，因
     }
     g_overlay_plane_id=overlay_plane_id_;
     
-    std::cout << "[INFO] 双缓冲透明 UI 硬件图层开辟成功！" << std::endl;
+    //std::cout << "[INFO] 双缓冲透明 UI 硬件图层开辟成功！" << std::endl;
     return true; 
 }

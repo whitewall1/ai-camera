@@ -73,6 +73,9 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
     cv::Mat rga_mat_wrapper(image_height, aligned_w, CV_8UC3, rga_buf.data());
     // 预分配一块连续紧凑的内存，给 NPU 喂数据用
     cv::Mat packed_mat(image_height, image_width, CV_8UC3);
+    cv::Mat last_packed_mat; // 用来保存上一帧的原始像素，用于比对
+    // 在 while 循环外面定义
+    auto last_npu_time = std::chrono::steady_clock::now();
 
     while (vision_thread_running && keep_running) {
         if (is_llm_generating) {
@@ -94,38 +97,20 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
         }
 
         if (process_id != -1) {
-            // // ==================== 探针 1：保存 RGA 处理前（摄像头原始 NV12） ====================
-            // // 你的 init_camera 里已经把 DMA-BUF 映射到了虚拟内存 CS.buffers[i].start
-            // // NV12 格式在内存中占用的大小是 height * width * 1.5 (即 height * 3 / 2)
-            // cv::Mat yuv_mat(IMG_HEIGHT * 3 / 2, IMG_WIDTH, CV_8UC1, CS.buffers[process_id].start);
-            // cv::Mat src_bgr;
-            // // 将 NV12 转为 OpenCV 认识的 BGR 格式用于正常保存和预览
-            // cv::cvtColor(yuv_mat, src_bgr, cv::COLOR_YUV2BGR_NV12);
-
-            // auto now = std::chrono::system_clock::now();
-            // auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-            // std::time_t t = std::chrono::system_clock::to_time_t(now);
-            // std::tm tm = *std::localtime(&t);
-            // char time_buf[64];
-            // std::strftime(time_buf, sizeof(time_buf), "%H-%M-%S", &tm);
-            // std::string time_str = std::string(time_buf) + "_" + std::to_string(ms.count());
-
-            // std::string before_name = "debug_before_" + time_str + ".jpg";
-            // cv::imwrite(before_name, src_bgr);
-            // // ==============================================================================
             memset(rga_buf.data(), 127, aligned_w * image_height * 3);
 
 
             rga_buffer_t src = wrapbuffer_fd(process_fd, IMG_WIDTH, IMG_HEIGHT, RK_FORMAT_YCbCr_420_SP);
             rga_buffer_t dst = wrapbuffer_virtualaddr((void*)rga_buf.data(), image_width, image_height, RK_FORMAT_RGB_888, (int)aligned_w, (int)image_height);
            
-
+            
             // 执行 RGA
             IM_STATUS rga_stat = improcess(src, dst, empty_pat, src_rect, dst_rect, empty_rect, 0);
             if (rga_stat != IM_STATUS_SUCCESS) {
                 printf("[ERROR] RGA improcess failed: %s\n", imStrError(rga_stat));
             }
            rga_mat_wrapper(cv::Rect(0, 0, image_width, image_height)).copyTo(packed_mat);
+           
            
             // 释放这帧摄像头 Buffer (重要！)
             {
@@ -144,19 +129,66 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
                 if(last_held_index == process_id) last_held_index = -1;
                 ioctl(CS.fd, VIDIOC_QBUF, &qbuf);
             }
+            bool should_run_npu = false;
+            std::string trigger_reason = "";
 
-            // 2. 执行 NPU 视觉编码
-            int ret = run_imgenc(app_ctx, packed_mat.data, local_img_vec.data());
-            if (ret != 0) {
-                printf("[ERROR] run_imgenc fail! ret=%d\n", ret);
-            }
+            auto now = std::chrono::steady_clock::now();
+            auto seconds_since_last_npu = std::chrono::duration_cast<std::chrono::seconds>(now - last_npu_time).count();
+            
+            if (!last_packed_mat.empty()) {
+                // 方案 A：像素阈值占比
+                cv::Mat diff, gray_diff, thresh;
+                // 1. 求绝对差值
+                cv::absdiff(packed_mat, last_packed_mat, diff);
+                // 2. 转灰度图，降低计算量
+                cv::cvtColor(diff, gray_diff, cv::COLOR_BGR2GRAY);
+                // 3. 核心：二值化过滤噪点！像素差值大于 30（满分255）才认为是真变化，否则设为 0
+                cv::threshold(gray_diff, thresh, 30, 255, cv::THRESH_BINARY);
 
-            // 3. 把算好的特征放入“保险箱”
-            {
-                std::lock_guard<std::mutex> lock(vision_mutex);
-                global_img_embed = local_img_vec; // 拷贝给全局变量
-                is_vision_ready = true;
+                // 4. 统计真正发生了变化的像素点数量
+                int changed_pixels = cv::countNonZero(thresh);
+                float changed_ratio = (float)changed_pixels / (image_width * image_height);
+
+                // 如果画面有超过 3% 的区域发生实质性变化（捕捉人脸微表情、手势）
+                if (changed_ratio > 0.03f) {
+                    should_run_npu = true;
+                    trigger_reason = "局部动作触发 (变化率: " + std::to_string(changed_ratio * 100) + "%)";
+                } 
+                // 方案 C：心跳兜底机制
+                else if (seconds_since_last_npu >= 3) {
+                    should_run_npu = true;
+                    trigger_reason = "心跳兜底触发 (已超 3 秒)";
+                }
+            } else {
+                // 第一帧绝对要跑
+                should_run_npu = true;
+                trigger_reason = "系统初始化首帧";
             }
+           
+            if (should_run_npu) {
+                std::cout << "\n[VISION] 唤醒 NPU! 原因: " << trigger_reason  << std::endl;
+
+                // ... 执行 run_imgenc (耗时 3.5s) ...
+                // ... 更新 global_img_embed 和 is_vision_ready = true ...
+                int ret = run_imgenc(app_ctx, packed_mat.data, local_img_vec.data());
+                if (ret != 0) {
+                    printf("[ERROR] run_imgenc fail! ret=%d\n", ret);
+                }
+                // 3. 把算好的特征放入“保险箱”
+                {
+                    std::lock_guard<std::mutex> lock(vision_mutex);
+                    global_img_embed = local_img_vec; // 拷贝给全局变量
+                    is_vision_ready = true;
+                }
+                // 重置心跳计时器和上一帧画面
+                last_npu_time = std::chrono::steady_clock::now();
+                packed_mat.copyTo(last_packed_mat);
+            } else {
+                // 画面极其静止，且不到兜底时间，继续省电
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            }
+            
+            
         } else {
             // 如果没抓到图，稍微等一下
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

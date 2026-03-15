@@ -27,14 +27,15 @@ int init_imgenc(const char* model_path, rknn_app_context_t* app_ctx, const int c
     }
 
     printf("===the core num is %d===\n", core_num);
-    //  在此设置多核推理
+     //在此设置多核推理
     if (core_num == 2) {
-        int ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1);
+        ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1);
     } else if (core_num == 3) {
-        int ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2);
+        ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_0_1_2);
     } else {
-        int ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_AUTO);
+        ret = rknn_set_core_mask(ctx, RKNN_NPU_CORE_AUTO);
     }
+    //rknn_set_core_mask(ctx, RKNN_NPU_CORE_0);
     if (ret < 0) {
         printf("rknn_set_core_mask fail! ret=%d\n", ret);
         return -1;

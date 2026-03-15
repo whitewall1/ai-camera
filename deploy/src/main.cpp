@@ -92,6 +92,7 @@ int main(int argc, char** argv) {
     param.img_content = (argc > 9) ? argv[9] : "<|image_pad|>";
 
     std::chrono::high_resolution_clock::time_point t_start = std::chrono::high_resolution_clock::now();
+    //param.core_mask = RKLLM_NPU_CORE_1_2;
     if (rkllm_init(&llmHandle, &param, callback) != 0) {
         printf("[ERROR] rkllm init failed\n");
         exit_handler(-1);
