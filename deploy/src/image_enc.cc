@@ -108,7 +108,17 @@ int init_imgenc(const char* model_path, rknn_app_context_t* app_ctx, const int c
     }
     printf("model input height=%d, width=%d, channel=%d\n",
         app_ctx->model_height, app_ctx->model_width, app_ctx->model_channel);
+    uint32_t output_size = app_ctx->model_image_token * app_ctx->model_embed_size * sizeof(float);
 
+    // 【新增】：向系统申请一块 NPU 和 CPU 都能直接访问的连续物理内存
+    app_ctx->zero_copy_embed_mem = rknn_create_mem(ctx, output_size);
+    if (app_ctx->zero_copy_embed_mem == NULL) {
+        printf("[ERROR] rknn_create_mem 申请零拷贝物理内存失败！\n");
+        return -1;
+    }
+    printf("[INFO] 成功分配零拷贝物理内存，大小: %u 字节\n", output_size);
+
+    return 0;
     return 0;
 }
 
@@ -128,8 +138,8 @@ int release_imgenc(rknn_app_context_t* app_ctx)
     }
     return 0;
 }
-
-int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result)
+// 注意：去掉了原来的 float* out_result 参数，因为不需要外部接盘了
+int run_imgenc(rknn_app_context_t* app_ctx, void* img_data) 
 {
     int ret;
     rknn_input inputs[1];
@@ -138,7 +148,7 @@ int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result)
     memset(inputs, 0, sizeof(inputs));
     memset(outputs, 0, sizeof(outputs));
 
-    // Set Input Data
+    // 1. 设置输入 (这部分保持原样)
     inputs[0].index = 0;
     inputs[0].type  = RKNN_TENSOR_UINT8;
     inputs[0].fmt   = RKNN_TENSOR_NHWC;
@@ -151,28 +161,76 @@ int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result)
         return -1;
     }
 
-    // Run
+    // 2. 运行 NPU 计算
     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
     if (ret < 0) {
         printf("rknn_run fail! ret=%d\n", ret);
         return -1;
     }
 
-    // Get Output
-    outputs[0].want_float = 1;
+    // 3. 【核心改造：零拷贝输出】
+    outputs[0].want_float = 1;      // 依然需要底层自动反量化为 float
+    outputs[0].is_prealloc = 1;     // 【关键】告诉驱动：我已经准备好盘子了，别给我重新分配！
+    outputs[0].index = 0;
+    outputs[0].buf = app_ctx->zero_copy_embed_mem->virt_addr; // 指向我们申请的物理内存的虚拟映射地址
+    outputs[0].size = app_ctx->zero_copy_embed_mem->size;
+
+    // 获取输出：此时 NPU 会直接把 float 数据填入 app_ctx->zero_copy_embed_mem
     ret = rknn_outputs_get(app_ctx->rknn_ctx, 1, outputs, NULL);
     if (ret < 0) {
         printf("rknn_outputs_get fail! ret=%d\n", ret);
-        goto out;
+        return -1;
     }
 
-    // Post Process
-    memcpy(out_result, outputs[0].buf, outputs[0].size);
-
-    // Remeber to release rknn output
-    rknn_outputs_release(app_ctx->rknn_ctx, 1, outputs);
-
-out:
+    // 【重要】：删除了 memcpy！删除了 rknn_outputs_release！
+    // 因为这块内存是我们自己管理的全局物理内存，不需要释放，也不需要拷贝！
 
     return ret;
 }
+// int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result)
+// {
+//     int ret;
+//     rknn_input inputs[1];
+//     rknn_output outputs[1];
+
+//     memset(inputs, 0, sizeof(inputs));
+//     memset(outputs, 0, sizeof(outputs));
+
+//     // Set Input Data
+//     inputs[0].index = 0;
+//     inputs[0].type  = RKNN_TENSOR_UINT8;
+//     inputs[0].fmt   = RKNN_TENSOR_NHWC;
+//     inputs[0].size  = app_ctx->model_width * app_ctx->model_height * app_ctx->model_channel;
+//     inputs[0].buf   = img_data;
+
+//     ret = rknn_inputs_set(app_ctx->rknn_ctx, 1, inputs);
+//     if (ret < 0) {
+//         printf("rknn_input_set fail! ret=%d\n", ret);
+//         return -1;
+//     }
+
+//     // Run
+//     ret = rknn_run(app_ctx->rknn_ctx, nullptr);
+//     if (ret < 0) {
+//         printf("rknn_run fail! ret=%d\n", ret);
+//         return -1;
+//     }
+
+//     // Get Output
+//     outputs[0].want_float = 1;
+//     ret = rknn_outputs_get(app_ctx->rknn_ctx, 1, outputs, NULL);
+//     if (ret < 0) {
+//         printf("rknn_outputs_get fail! ret=%d\n", ret);
+//         goto out;
+//     }
+
+//     // Post Process
+//     memcpy(out_result, outputs[0].buf, outputs[0].size);
+
+//     // Remeber to release rknn output
+//     rknn_outputs_release(app_ctx->rknn_ctx, 1, outputs);
+
+// out:
+
+//     return ret;
+// }

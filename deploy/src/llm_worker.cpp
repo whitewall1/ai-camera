@@ -17,7 +17,7 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
     size_t image_height = app_ctx->model_height;
 
     // 线程内维护一份自己的特征向量副本来防止竞争
-    std::vector<float> local_img_vec;
+    //std::vector<float> local_img_vec;
 
     RKLLMInput rkllm_input;
     memset(&rkllm_input, 0, sizeof(RKLLMInput));
@@ -55,18 +55,19 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
                     std::cout << "\nuser: " << std::flush;
                     continue; 
                 }
-                local_img_vec = global_img_embed; // 极速深拷贝（微秒级）
+                //local_img_vec = global_img_embed; // 极速深拷贝（微秒级）
             }
             //auto feat_cost = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - t_feat_start).count();
             //std::cout << " -> 从后台获取最新视觉特征耗时: " << feat_cost << " us" << std::endl;
 
             rkllm_input.input_type = RKLLM_INPUT_MULTIMODAL;
             rkllm_input.multimodal_input.prompt = (char*)current_prompt.c_str();
-            rkllm_input.multimodal_input.image_embed = local_img_vec.data();
+            //rkllm_input.multimodal_input.image_embed = local_img_vec.data();
             rkllm_input.multimodal_input.n_image_tokens = n_image_tokens;
             rkllm_input.multimodal_input.n_image = 1;
             rkllm_input.multimodal_input.image_height = image_height;
             rkllm_input.multimodal_input.image_width = image_width;
+            rkllm_input.multimodal_input.image_embed = (float*)app_ctx->zero_copy_embed_mem->virt_addr;
         } else {
             rkllm_input.input_type = RKLLM_INPUT_PROMPT;
             rkllm_input.prompt_input = (char*)current_prompt.c_str();
@@ -75,8 +76,10 @@ void llm_worker_func(rknn_app_context_t* app_ctx) {
 
         // 3. 执行核心推理
         printf("robot: ");
+        // 直接让大模型从这块物理内存读取特征！
         
         is_llm_generating = true; // 【极其关键】抢占 NPU，让视觉线程挂起闭嘴
+        
         rkllm_run(llmHandle, &rkllm_input, &rkllm_infer_params, NULL);
         is_llm_generating = false; // 推理结束，松开刹车，视觉线程恢复常态感知
 

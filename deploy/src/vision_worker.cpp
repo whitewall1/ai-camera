@@ -66,7 +66,7 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
     im_rect empty_rect = {0, 0, 0, 0};
 
     // 提前分配好所有的物理/虚拟内存块 (整个线程生命周期只 new 这一次)
-    std::vector<float> local_img_vec(rkllm_image_embed_len);
+   
     std::vector<uint8_t> rga_buf(aligned_w * image_height * 3);
     
     // 预先包好 Mat 头，不分配新内存
@@ -76,7 +76,7 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
     cv::Mat last_packed_mat; // 用来保存上一帧的原始像素，用于比对
     // 在 while 循环外面定义
     auto last_npu_time = std::chrono::steady_clock::now();
-
+ 
     while (vision_thread_running && keep_running) {
         if (is_llm_generating) {
             // 如果 LLM 正在疯狂输出文字，我们就休眠，把算力和内存带宽全让给它！
@@ -170,14 +170,14 @@ void vision_worker_func(rknn_app_context_t* app_ctx) {
 
                 // ... 执行 run_imgenc (耗时 3.5s) ...
                 // ... 更新 global_img_embed 和 is_vision_ready = true ...
-                int ret = run_imgenc(app_ctx, packed_mat.data, local_img_vec.data());
+                int ret = run_imgenc(app_ctx, packed_mat.data);
                 if (ret != 0) {
                     printf("[ERROR] run_imgenc fail! ret=%d\n", ret);
                 }
                 // 3. 把算好的特征放入“保险箱”
                 {
                     std::lock_guard<std::mutex> lock(vision_mutex);
-                    global_img_embed = local_img_vec; // 拷贝给全局变量
+                    
                     is_vision_ready = true;
                 }
                 // 重置心跳计时器和上一帧画面

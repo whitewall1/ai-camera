@@ -17,14 +17,16 @@ typedef struct {
     int model_height;
     int model_image_token;
     int model_embed_size;
+    // 在你的 rknn_app_context_t 结构体里加上这一行：
+    rknn_tensor_mem* zero_copy_embed_mem;
 } rknn_app_context_t;
 
 int init_imgenc(const char* model_path, rknn_app_context_t* app_ctx, const int core_num);
 
 int release_imgenc(rknn_app_context_t* app_ctx);
 
-int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result);
-
+//int run_imgenc(rknn_app_context_t* app_ctx, void* img_data, float* out_result);
+int run_imgenc(rknn_app_context_t* app_ctx, void* img_data);
 #ifdef __cplusplus
 }
 #endif
